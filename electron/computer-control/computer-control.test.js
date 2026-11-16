@@ -10,6 +10,8 @@ import {
 	canonIntent,
 	create_computer_control,
 	default_apps,
+	default_links,
+	fill_link,
 	load_apps,
 	match_app,
 	register_computer_control
@@ -119,7 +121,13 @@ test('apps.json is seeded with defaults on first run and then read back', () => 
 		second.apps.map((a) => a.id),
 		['x']
 	);
-	assert.match(second.warning ?? '', /1 entry/);
+	assert.match(second.warning ?? '', /1 app ignored/);
+
+	// a file from before deep links existed gets default links and vars added, apps untouched
+	const migrated = JSON.parse(fs.readFileSync(file, 'utf-8'));
+	assert.deepEqual(migrated.links, default_links());
+	assert.deepEqual(migrated.vars, { instagram_handle: '' });
+	assert.equal(migrated.apps.length, 2);
 });
 
 test('a corrupt apps.json is left alone and defaults are used', () => {
@@ -226,6 +234,7 @@ test('commands are never silently dropped', async () => {
 
 	result = await control.run({ action: 'list apps' });
 	assert.equal(result.ok && result.apps?.length, 6);
+	assert.equal(result.ok && result.links?.length, default_links().length);
 });
 
 test('a real detached process is spawned', async () => {
@@ -266,4 +275,117 @@ test('register_computer_control seeds apps.json and registers an IPC handler', a
 	assert.ok(handler);
 	const result = await handler({}, { action: 'list_apps' });
 	assert.equal(result.ok, true);
+});
+
+/**
+ * @param {string} dir
+ * @param {Record<string, string>} vars
+ */
+function set_vars(dir, vars) {
+	const file = path.join(dir, 'apps.json');
+	const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
+	data.vars = vars;
+	fs.writeFileSync(file, JSON.stringify(data));
+}
+
+test('"new Google Doc" opens the Docs create link in the browser', async () => {
+	const { calls, control } = setup();
+	for (const command of [
+		{ action: 'open app', target: 'new Google Doc' },
+		{ action: 'new Google Doc' },
+		{ action: 'open website', target: 'create a google doc' },
+		{ target: 'new google doc' }
+	]) {
+		const result = await control.run(command);
+		assert.equal(
+			result.ok && result.message,
+			'Opened a new Google Doc in Firefox',
+			JSON.stringify(command)
+		);
+		assert.equal(calls.at(-1)?.command, '/usr/bin/firefox');
+		assert.deepEqual(calls.at(-1)?.args, ['https://docs.google.com/document/create']);
+	}
+	assert.equal(calls.length, 4);
+});
+
+test('"Open Instagram" opens the profile from vars.instagram_handle', async () => {
+	const { dir, calls, control } = setup();
+
+	// no handle yet: home page, plus a hint where to set it
+	let result = await control.run({ action: 'Open Instagram' });
+	assert.equal(result.ok, true);
+	assert.deepEqual(calls.at(-1)?.args, ['https://www.instagram.com/']);
+	assert.match(result.ok ? result.message : '', /"instagram_handle" under "vars"/);
+
+	set_vars(dir, { instagram_handle: '@svelte.js' });
+	result = await control.run({ action: 'open app', target: 'Instagram' });
+	assert.equal(result.ok && result.message, 'Opened Instagram in Firefox');
+	assert.deepEqual(calls.at(-1)?.args, ['https://www.instagram.com/svelte.js']);
+});
+
+test('link placeholders are encoded so they cannot change the URL', () => {
+	assert.deepEqual(
+		fill_link('https://www.instagram.com/{instagram_handle}', { instagram_handle: '../x?y' }),
+		{
+			url: 'https://www.instagram.com/..%2Fx%3Fy',
+			missing: []
+		}
+	);
+});
+
+test('other default links resolve', () => {
+	const links = default_links();
+	/** @type {Record<string, string>} */
+	const expected = {
+		'new spreadsheet': 'https://docs.google.com/spreadsheets/create',
+		'new presentation': 'https://docs.google.com/presentation/create',
+		'compose email': 'https://mail.google.com/mail/?view=cm&fs=1',
+		'check my email': 'https://mail.google.com/',
+		'schedule a meeting': 'https://calendar.google.com/calendar/r/eventedit',
+		'new repo': 'https://github.com/new',
+		'open youtube': 'https://www.youtube.com/'
+	};
+	for (const [phrase, url] of Object.entries(expected)) {
+		assert.equal(match_app(phrase, links)?.url, url, phrase);
+	}
+});
+
+test('links can name a browser, and apps still win over links on a tie', async () => {
+	const { dir, calls, control } = setup();
+	const file = path.join(dir, 'apps.json');
+	load_apps(dir, 'linux');
+	const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
+	data.links.unshift({
+		id: 'notes_web',
+		name: 'Web notes',
+		url: 'https://example.com/notes',
+		intents: ['take notes'],
+		browser: 'chrome'
+	});
+	data.links.push({
+		id: 'intranet',
+		name: 'Intranet',
+		url: 'https://intranet.example.com',
+		intents: ['intranet'],
+		browser: 'chrome'
+	});
+	fs.writeFileSync(file, JSON.stringify(data));
+
+	await control.run({ action: 'open', target: 'intranet' });
+	assert.equal(calls.at(-1)?.command, '/usr/bin/google-chrome');
+
+	await control.run({ action: 'open', target: 'take notes' });
+	assert.equal(calls.at(-1)?.command, '/usr/bin/gedit');
+});
+
+test('an unknown website phrase is reported, not dropped', async () => {
+	const { calls, control } = setup();
+	const result = await control.run({ action: 'visit site', target: 'my bank' });
+	assert.match(result.ok ? '' : result.error, /I don't have a web address for "my bank"/);
+	assert.equal(calls.length, 0);
+
+	// but "browse the web" with no address still just opens the browser
+	const browse = await control.run({ action: 'browse', target: 'browse the web' });
+	assert.equal(browse.ok, true);
+	assert.deepEqual(calls.at(-1)?.args, []);
 });

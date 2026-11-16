@@ -23,7 +23,10 @@ const OPEN_VERBS = new Set([
 	'fire',
 	'bring',
 	'show',
-	'use'
+	'use',
+	'new',
+	'create',
+	'compose'
 ]);
 
 const APP_NOUNS = new Set([

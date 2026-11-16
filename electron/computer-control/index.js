@@ -1,12 +1,14 @@
 import { ACTIONS, canonIntent } from './canon-intent.js';
-import { load_apps, match_app } from './apps.js';
+import { fill_link, load_apps, match_app } from './apps.js';
 import { launch } from './launcher.js';
 
 /** @import { AppDefinition } from './default-apps.js' */
+/** @import { LinkDefinition } from './default-links.js' */
 /** @import { LaunchDeps } from './launcher.js' */
 
 export { ACTIONS, canonIntent } from './canon-intent.js';
-export { load_apps, match_app } from './apps.js';
+export { fill_link, load_apps, match_app } from './apps.js';
+export { default_links, default_vars } from './default-links.js';
 export { launch } from './launcher.js';
 export { default_apps } from './default-apps.js';
 
@@ -26,7 +28,7 @@ export const IPC_CHANNEL = 'computer-control:run';
  */
 
 /**
- * @typedef {{ ok: true, action: string, message: string, pid?: number, apps?: Array<{ id: string, name: string }> }
+ * @typedef {{ ok: true, action: string, message: string, pid?: number, apps?: Array<{ id: string, name: string }>, links?: Array<{ id: string, name: string }> }
  *   | { ok: false, action: string | null, error: string }} RunResult
  */
 
@@ -57,17 +59,29 @@ export function create_computer_control(options) {
 
 		const target = first_string(command.target, command.app, command.query);
 		const url = first_string(command.url);
+		const action_text = first_string(command.action);
 
-		let action = canonIntent(command.action);
+		const loaded = apps();
+		const { apps: list, links, file } = loaded;
+		const deps = { ...launch_deps, apps_file: file };
+
+		/** @param {string} phrase */
+		const match_any = (phrase) => match_app(phrase, [...list, ...links]);
+
+		let action = canonIntent(action_text);
 
 		if (action === null) {
-			const has_action = typeof command.action === 'string' && command.action.trim() !== '';
-			if (has_action) {
-				return {
-					ok: false,
-					action: null,
-					error: `I don't know how to "${command.action}". Supported actions: ${Object.values(ACTIONS).join(', ')}.`
-				};
+			if (action_text) {
+				// the AI put the whole request in `action`, e.g. "new Google Doc" — try it as a phrase
+				const entry = target ? null : match_any(action_text);
+				if (!entry) {
+					return {
+						ok: false,
+						action: null,
+						error: `I don't know how to "${action_text}". Supported actions: ${Object.values(ACTIONS).join(', ')}.`
+					};
+				}
+				return open_entry(ACTIONS.OPEN_APP, entry);
 			}
 			// no action at all — infer it from what we were given
 			if (url) action = ACTIONS.OPEN_URL;
@@ -80,30 +94,91 @@ export function create_computer_control(options) {
 			action = ACTIONS.OPEN_URL;
 		}
 
-		const { apps: list, file } = apps();
-		const deps = { ...launch_deps, apps_file: file };
-
 		if (action === ACTIONS.LIST_APPS) {
 			return {
 				ok: true,
 				action,
-				message: list.map((a) => a.name).join(', '),
-				apps: list.map((a) => ({ id: a.id, name: a.name }))
+				message: `Apps: ${list.map((a) => a.name).join(', ')}. Links: ${links.map((l) => l.name).join(', ')}.`,
+				apps: list.map((a) => ({ id: a.id, name: a.name })),
+				links: links.map((l) => ({ id: l.id, name: l.name }))
 			};
 		}
 
 		if (action === ACTIONS.OPEN_URL) {
 			const raw_url = url ?? (target && looks_like_url(target) ? target : undefined);
-			const browser = pick_browser(list, first_string(command.browser, command.app));
 
-			if (!browser) {
-				return { ok: false, action, error: `No browser is configured in ${file}.` };
+			if (raw_url) {
+				return open_url(action, raw_url, first_string(command.browser, command.app));
 			}
 
-			if (!raw_url) {
-				// "browse the web" with no address: just open the browser
-				return with_action(action, await launch(browser, [], deps));
+			// "go to instagram" / { action: 'open website', target: 'new google doc' }
+			const phrase = target ?? action_text;
+			const link = phrase ? match_app(phrase, links) : null;
+			if (link) return open_entry(action, link);
+
+			const named_app = target ? match_app(target, list) : null;
+			if (target && !named_app?.browser) {
+				return {
+					ok: false,
+					action,
+					error: `I don't have a web address for "${target}". You can add it to "links" in ${file}.`
+				};
 			}
+
+			// "browse the web" with no address: just open the browser
+			const browser = pick_browser(list, first_string(command.browser, named_app?.id));
+			if (!browser) return { ok: false, action, error: `No browser is configured in ${file}.` };
+			return with_action(action, await launch(browser, [], deps));
+		}
+
+		// OPEN_APP — "open instagram" with no target is matched on the action text itself
+		const phrase = target ?? action_text;
+		const entry = phrase ? match_any(phrase) : null;
+		if (!entry) {
+			if (!target) return { ok: false, action, error: 'Which app should I open?' };
+			return {
+				ok: false,
+				action,
+				error: `I don't know an app or link for "${target}". Known apps: ${list.map((a) => a.name).join(', ')}. You can add more in ${file}.`
+			};
+		}
+
+		return open_entry(action, entry);
+
+		/**
+		 * @param {string} action
+		 * @param {AppDefinition | LinkDefinition} entry
+		 * @returns {Promise<RunResult>}
+		 */
+		async function open_entry(action, entry) {
+			if (!('url' in entry)) {
+				return with_action(action, await launch(entry, [], deps));
+			}
+
+			const { url: filled, missing } = fill_link(entry.url, loaded.vars);
+			const result = await open_url(
+				action,
+				filled,
+				first_string(command.browser, entry.browser),
+				entry.name
+			);
+			if (result.ok && missing.length > 0) {
+				result.message += ` (set ${missing.map((m) => `"${m}"`).join(', ')} under "vars" in ${file} to go straight to your page)`;
+			}
+			return result;
+		}
+
+		/**
+		 * Websites are always handed to the browser as a command-line argument.
+		 * @param {string} action
+		 * @param {string} raw_url
+		 * @param {string} [browser_name]
+		 * @param {string} [label]
+		 * @returns {Promise<RunResult>}
+		 */
+		async function open_url(action, raw_url, browser_name, label) {
+			const browser = pick_browser(list, browser_name);
+			if (!browser) return { ok: false, action, error: `No browser is configured in ${file}.` };
 
 			const href = to_web_url(raw_url);
 			if (!href) {
@@ -113,25 +188,9 @@ export function create_computer_control(options) {
 			const result = await launch(browser, [href], deps);
 			return with_action(
 				action,
-				result.ok ? { ...result, message: `Opened ${href} in ${browser.name}` } : result
+				result.ok ? { ...result, message: `Opened ${label ?? href} in ${browser.name}` } : result
 			);
 		}
-
-		// OPEN_APP
-		if (!target) {
-			return { ok: false, action, error: 'Which app should I open?' };
-		}
-
-		const app = match_app(target, list);
-		if (!app) {
-			return {
-				ok: false,
-				action,
-				error: `I don't know an app for "${target}". Known apps: ${list.map((a) => a.name).join(', ')}. You can add more in ${file}.`
-			};
-		}
-
-		return with_action(action, await launch(app, [], deps));
 	}
 
 	return { run, apps };
