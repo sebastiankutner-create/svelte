@@ -7,7 +7,11 @@ export const ACTIONS = /** @type {const} */ ({
 	OPEN_APP: 'open_app',
 	OPEN_URL: 'open_url',
 	LIST_APPS: 'list_apps',
-	ANALYZE_SCREEN: 'analyze_screen'
+	ANALYZE_SCREEN: 'analyze_screen',
+	PLAY_VIDEO: 'play_video',
+	PAUSE_VIDEO: 'pause_video',
+	RESUME_VIDEO: 'resume_video',
+	SET_VOLUME: 'set_volume'
 });
 
 /** @typedef {typeof ACTIONS[keyof typeof ACTIONS]} Action */
@@ -67,6 +71,8 @@ const SCREEN_WORDS = new Set([
 	'monitors'
 ]);
 
+const VIDEO_WORDS = new Set(['video', 'videos', 'clip', 'youtube', 'playback']);
+
 const LIST_VERBS = new Set(['list', 'show', 'get', 'available', 'which', 'what', 'enumerate']);
 
 /**
@@ -108,9 +114,28 @@ export function canonIntent(raw) {
 
 	const has = (/** @type {Set<string>} */ set) => tokens.some((t) => set.has(t));
 
+	// "play video about monitors" is a video request, not a screen one
+	if (tokens.includes('play') && has(VIDEO_WORDS)) return ACTIONS.PLAY_VIDEO;
+
 	// "analyze my screen", "look at screen", "take screenshot", "what do you see"
 	if (has(SCREEN_WORDS) || /\bwhat (?:do|can) you see\b/.test(tokens.join(' '))) {
 		return ACTIONS.ANALYZE_SCREEN;
+	}
+
+	// "set volume", "volume up to 40"
+	if (tokens.includes('volume')) return ACTIONS.SET_VOLUME;
+
+	// "pause video", "stop the video", "resume", "unpause"
+	if (tokens.includes('unpause') || tokens.includes('resume')) return ACTIONS.RESUME_VIDEO;
+	if (tokens.includes('pause') || (tokens.includes('stop') && has(VIDEO_WORDS)))
+		return ACTIONS.PAUSE_VIDEO;
+
+	// "play video", "play_video", "search youtube" (no query → the router resumes instead)
+	if (
+		tokens.includes('play') ||
+		(has(VIDEO_WORDS) && tokens.some((t) => t === 'search' || t === 'find'))
+	) {
+		return ACTIONS.PLAY_VIDEO;
 	}
 
 	// "list apps", "show applications", "what apps are available"

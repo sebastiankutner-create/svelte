@@ -9,7 +9,8 @@
 		"forceConsistentCasingInFileNames": true,
 		"allowJs": true,
 		"checkJs": true,
-		"types": ["node"]
+		"types": ["node"],
+		"lib": ["ESNext", "DOM", "DOM.Iterable"]
 	},
-	"include": ["./computer-control"]
+	"include": ["./computer-control", "./renderer", "./preload.cjs"]
 }
