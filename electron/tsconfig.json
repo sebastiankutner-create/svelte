@@ -1,0 +1,15 @@
+{
+	"compilerOptions": {
+		"moduleResolution": "NodeNext",
+		"target": "ESNext",
+		"module": "NodeNext",
+		"strict": true,
+		"noEmit": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true,
+		"allowJs": true,
+		"checkJs": true,
+		"types": ["node"]
+	},
+	"include": ["./computer-control"]
+}
