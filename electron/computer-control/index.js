@@ -5,6 +5,15 @@ import { parse_screen_request } from './screen-intent.js';
 import { create_screen_analyzer } from './screen-vision.js';
 import { parse_video_command, parse_volume } from './video-intent.js';
 import { is_video_id, search_youtube, YouTubeSearchError } from './youtube-search.js';
+import {
+	confirmation,
+	FileSaveError,
+	FORMATS,
+	normalise_format,
+	save_document
+} from './file-output.js';
+import { parse_file_request } from './file-intent.js';
+import { generate_markdown, GenerationError } from './document-generator.js';
 
 /** @import { AppDefinition } from './default-apps.js' */
 /** @import { LinkDefinition } from './default-links.js' */
@@ -13,7 +22,9 @@ import { is_video_id, search_youtube, YouTubeSearchError } from './youtube-searc
 /** @import { CaptureDeps } from './screen-capture.js' */
 /** @import { VideoResult } from './youtube-search.js' */
 /** @import { Memory } from './memory.js' */
-/** @import { MissionLog } from './mission-log.js' */
+/** @import { MissionLog, Logger } from './mission-log.js' */
+/** @import { PdfFonts } from './document-renderers.js' */
+/** @import { FileFormat } from './file-output.js' */
 
 export { ACTIONS, canonIntent } from './canon-intent.js';
 export { fill_link, load_apps, match_app } from './apps.js';
@@ -25,6 +36,23 @@ export { capture_all_screens } from './screen-capture.js';
 export { parse_video_command, parse_volume } from './video-intent.js';
 export { extract_first_video, search_url, search_youtube } from './youtube-search.js';
 export { start_renderer_server } from './loopback-server.js';
+export { parse_markdown, parse_inline, first_h1 } from './markdown-blocks.js';
+export {
+	blocks_to_text,
+	create_pdf_renderer,
+	render_docx,
+	render_txt,
+	to_win_ansi
+} from './document-renderers.js';
+export {
+	default_desktop_dir,
+	normalise_format,
+	reserve_file,
+	safe_file_name,
+	save_document
+} from './file-output.js';
+export { parse_file_request } from './file-intent.js';
+export { generate_markdown, DEFAULT_DOCUMENT_MODEL } from './document-generator.js';
 export { create_memory, DEFAULT_MEMORY_MODEL, ExtractionError } from './memory.js';
 export {
 	create_mission_log,
@@ -76,6 +104,9 @@ export const VIDEO_CHANNEL = 'assistant:video';
  * @property {string} [question] for analyze_screen: what to answer about the screen
  * @property {string} [video_id] for play_video: play this video instead of searching
  * @property {number | string} [volume] for set_volume: 0–100 (or words like "forty")
+ * @property {string} [format] for create_file: "pdf", "docx"/"word" or "txt"/"text"
+ * @property {string} [topic] for create_file: what the document is about (also the fallback file name)
+ * @property {string} [markdown] for create_file: the content, if the AI already wrote it
  */
 
 /**
@@ -91,7 +122,16 @@ export const VIDEO_CHANNEL = 'assistant:video';
  */
 
 /**
- * @typedef {{ ok: true, action: string, message: string, pid?: number, video_id?: string, volume?: number, question?: string | null, screens?: number, apps?: Array<{ id: string, name: string }>, links?: Array<{ id: string, name: string }> }
+ * @typedef {object} FileOptions
+ * @property {string} [dir] Where files go. Pass `app.getPath('desktop')`.
+ * @property {(input: { request: string, format_name: string }) => Promise<string>} [generate] Writes the Markdown. Defaults to Groq.
+ * @property {(text: string) => unknown} [speak]
+ * @property {Logger} [log]
+ * @property {PdfFonts} [pdf_fonts] TrueType fonts for full Unicode in PDFs.
+ */
+
+/**
+ * @typedef {{ ok: true, action: string, message: string, pid?: number, video_id?: string, volume?: number, file?: string, file_name?: string, question?: string | null, screens?: number, apps?: Array<{ id: string, name: string }>, links?: Array<{ id: string, name: string }> }
  *   | { ok: false, action: string | null, error: string }} RunResult
  */
 
@@ -100,7 +140,8 @@ export const VIDEO_CHANNEL = 'assistant:video';
  *   user_data_dir: string,
  *   warn?: (message: string) => void,
  *   screen?: ScreenAnalyzerOptions,
- *   video?: VideoOptions
+ *   video?: VideoOptions,
+ *   files?: FileOptions
  * }} Options
  */
 
@@ -108,7 +149,7 @@ export const VIDEO_CHANNEL = 'assistant:video';
  * @param {Options} options
  */
 export function create_computer_control(options) {
-	const { user_data_dir, warn = () => {}, screen, video, ...launch_deps } = options;
+	const { user_data_dir, warn = () => {}, screen, video, files, ...launch_deps } = options;
 	/** @type {string | null} the video the player was last told to load */
 	let current_video = null;
 	const analyzer = screen ? create_screen_analyzer(screen) : null;
@@ -158,6 +199,8 @@ export function create_computer_control(options) {
 		}
 
 		if (action === null) action = parse_video_command(action_text)?.action ?? null;
+		if (action === null && parse_file_request(action_text)) action = ACTIONS.CREATE_FILE;
+		if (action === ACTIONS.CREATE_FILE) return create_file(command);
 		if (action !== null && VIDEO_ACTIONS.has(action)) {
 			return video_action(/** @type {VideoAction} */ (action), command);
 		}
@@ -409,6 +452,70 @@ export function create_computer_control(options) {
 	}
 
 	/**
+	 * @param {Command} command
+	 * @returns {Promise<RunResult>}
+	 */
+	async function create_file(command) {
+		const action = ACTIONS.CREATE_FILE;
+		const parsed =
+			parse_file_request(command.action) ??
+			parse_file_request(first_string(command.query, command.target));
+		/** @type {FileFormat | null} */
+		const format = normalise_format(command.format) ?? parsed?.format ?? null;
+		const topic = first_string(command.topic, parsed?.topic, command.query, command.target) ?? null;
+		const markdown = first_string(command.markdown);
+
+		if (!format)
+			return {
+				ok: false,
+				action,
+				error: 'Which format would you like: PDF, Word, or a text file?'
+			};
+		if (!markdown && !topic)
+			return { ok: false, action, error: 'What should the document be about?' };
+
+		try {
+			const content =
+				markdown ??
+				(await (files?.generate ?? ((input) => generate_markdown(input)))({
+					request: /** @type {string} */ (topic),
+					format_name: FORMATS[format].spoken
+				}));
+			const saved = await save_document({
+				markdown: content,
+				format,
+				topic,
+				dir: files?.dir,
+				pdf_fonts: files?.pdf_fonts
+			});
+			return {
+				ok: true,
+				action,
+				message: confirmation(saved),
+				file: saved.file,
+				file_name: saved.file_name
+			};
+		} catch (e) {
+			const known = e instanceof FileSaveError || e instanceof GenerationError;
+			const error = known
+				? /** @type {Error} */ (e).message
+				: `Something went wrong making the file: ${/** @type {Error} */ (e)?.message ?? e}`;
+			try {
+				files?.log?.({
+					level: 'error',
+					source: 'files',
+					event: 'create_failed',
+					message: error,
+					detail: { format, topic, generated: !markdown }
+				});
+			} catch {
+				// logging must not break the command
+			}
+			return { ok: false, action, error };
+		}
+	}
+
+	/**
 	 * Check a raw transcript before it goes to the language model. Screen requests and video
 	 * commands are handled right here (with spoken feedback); anything else returns `null` so
 	 * the caller carries on.
@@ -421,7 +528,22 @@ export function create_computer_control(options) {
 		if (screen_request) return analyze_screen(screen_request.question);
 
 		const video_command = parse_video_command(text);
-		if (!video_command) return null;
+		if (!video_command) {
+			const file_request = parse_file_request(text);
+			if (!file_request) return null;
+			// writing the document can take a while; say something so silence isn't confusing
+			await say(
+				`Writing a ${FORMATS[file_request.format].spoken} about ${file_request.topic}.`,
+				files?.speak
+			);
+			const result = await create_file({
+				action: text,
+				format: file_request.format,
+				topic: file_request.topic
+			});
+			await say(result.ok ? result.message : result.error, files?.speak);
+			return result;
+		}
 
 		const result = await video_action(video_command.action, {
 			action: text,
@@ -434,10 +556,13 @@ export function create_computer_control(options) {
 		return result;
 	}
 
-	/** @param {string} text */
-	async function say(text) {
+	/**
+	 * @param {string} text
+	 * @param {((text: string) => unknown) | undefined} [speak]
+	 */
+	async function say(text, speak = video?.speak) {
 		try {
-			await video?.speak?.(text);
+			await speak?.(text);
 		} catch {
 			// TTS failures must not break the command
 		}
@@ -451,7 +576,7 @@ export function create_computer_control(options) {
  * full setup (loopback server, window, preload).
  *
  * @param {{
- *   app: { getPath(name: 'userData'): string },
+ *   app: { getPath(name: 'userData' | 'desktop'): string },
  *   ipcMain: { handle(channel: string, listener: (event: unknown, arg: any) => Promise<unknown>): void },
  *   get_window?: () => { isDestroyed(): boolean, webContents: { send(channel: string, ...args: unknown[]): void } } | null | undefined,
  *   desktopCapturer?: CaptureDeps['desktopCapturer'],
@@ -502,7 +627,13 @@ export function register_computer_control({
 						return true;
 					}
 				}
-			: undefined
+			: undefined,
+		files: {
+			dir: app.getPath('desktop'),
+			speak,
+			log: mission_log?.log,
+			generate: (input) => generate_markdown(input, { context: memory?.context_block })
+		}
 	});
 
 	// seed apps.json on startup rather than on the first command

@@ -104,15 +104,16 @@ handles screen requests and video commands (and speaks the reply); it returns `n
 anything else, which then goes to your language model as usual. Commands the model produces
 go to `window.assistant.run(command)`.
 
-| Say                                    | Does                                                            |
-| -------------------------------------- | --------------------------------------------------------------- |
-| "open google chrome", "browse the web" | launches the app from `userData/apps.json`                      |
-| "new Google Doc", "open Instagram"     | opens the deep link from `apps.json` in the browser             |
-| "analyze my screen", "what do you see" | captures all monitors and describes them by voice               |
-| "look at my screen and tell me X"      | answers X using the screenshot                                  |
-| "play a video about X"                 | scrapes YouTube search, loads the first result in the player    |
-| "pause the video" / "resume the video" | sends `pauseVideo` / `playVideo`                                |
-| "set volume to X"                      | sends `setVolume` (0–100; words like "forty" or "max" work too) |
+| Say                                                                                      | Does                                                                |
+| ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| "open google chrome", "browse the web"                                                   | launches the app from `userData/apps.json`                          |
+| "new Google Doc", "open Instagram"                                                       | opens the deep link from `apps.json` in the browser                 |
+| "analyze my screen", "what do you see"                                                   | captures all monitors and describes them by voice                   |
+| "look at my screen and tell me X"                                                        | answers X using the screenshot                                      |
+| "play a video about X"                                                                   | scrapes YouTube search, loads the first result in the player        |
+| "pause the video" / "resume the video"                                                   | sends `pauseVideo` / `playVideo`                                    |
+| "set volume to X"                                                                        | sends `setVolume` (0–100; words like "forty" or "max" work too)     |
+| "make a PDF about X", "write a Word document summarizing X", "create a text file with X" | writes the document, saves it to the Desktop and says the file name |
 
 Tests: `node --test electron/computer-control/*.test.js`
 
@@ -146,3 +147,20 @@ load recoveries and save failures are logged as `load_recovered` / `save_failed`
 In the renderer, `window.assistant.missionLog.onEntry(cb)` delivers live entries and
 `missionLog.history()` returns the last 200 (including ones logged before the window
 loaded). `renderer/mission-log-view.js` renders them; point it at your own list element.
+
+## Files
+
+Voice requests like "make a PDF about black holes" have Groq (`GROQ_DOCUMENT_MODEL`,
+default `openai/gpt-oss-120b`, with remembered facts) write the document as Markdown. If your
+own model already wrote it, send `{ action: 'create_file', format: 'pdf' | 'docx' | 'txt', markdown, topic }`
+to `window.assistant.run()` and it is saved as-is.
+
+The Markdown is parsed into headings, paragraphs, bullet and numbered lists (plus code
+blocks) and rendered with pdfkit (A4, 2 cm margins), docx (`Packer.toBuffer()`) or plain
+text. Files go to `app.getPath('desktop')`, named after the first `#` heading, or the topic if
+there is none. An existing file is never overwritten: `Title (1).pdf`, `Title (2).pdf`, ...
+
+PDFs use the built-in Helvetica, which covers Western European text; other characters are
+transliterated or dropped. For full Unicode, pass TrueType fonts:
+`create_computer_control({ files: { pdf_fonts: { regular, bold, italic, bold_italic } } })`.
+Failures are spoken and logged to the mission log as `files/create_failed`.

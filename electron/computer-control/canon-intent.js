@@ -11,7 +11,8 @@ export const ACTIONS = /** @type {const} */ ({
 	PLAY_VIDEO: 'play_video',
 	PAUSE_VIDEO: 'pause_video',
 	RESUME_VIDEO: 'resume_video',
-	SET_VOLUME: 'set_volume'
+	SET_VOLUME: 'set_volume',
+	CREATE_FILE: 'create_file'
 });
 
 /** @typedef {typeof ACTIONS[keyof typeof ACTIONS]} Action */
@@ -73,6 +74,20 @@ const SCREEN_WORDS = new Set([
 
 const VIDEO_WORDS = new Set(['video', 'videos', 'clip', 'youtube', 'playback']);
 
+const FILE_FORMATS = new Set(['pdf', 'docx', 'txt']);
+const FILE_VERBS = new Set([
+	'create',
+	'make',
+	'write',
+	'generate',
+	'draft',
+	'save',
+	'export',
+	'produce',
+	'prepare'
+]);
+const FILE_NOUNS = new Set(['file', 'document', 'doc', 'word', 'text', 'report']);
+
 const LIST_VERBS = new Set(['list', 'show', 'get', 'available', 'which', 'what', 'enumerate']);
 
 /**
@@ -113,6 +128,16 @@ export function canonIntent(raw) {
 	}
 
 	const has = (/** @type {Set<string>} */ set) => tokens.some((t) => set.has(t));
+
+	// "create file", "make pdf", "save as docx", "write word document" (but not "create google doc")
+	if (
+		!tokens.includes('google') &&
+		(has(FILE_FORMATS) ||
+			(has(FILE_VERBS) && tokens.includes('file')) ||
+			(has(FILE_VERBS) && tokens.includes('word')))
+	) {
+		return ACTIONS.CREATE_FILE;
+	}
 
 	// "play video about monitors" is a video request, not a screen one
 	if (tokens.includes('play') && has(VIDEO_WORDS)) return ACTIONS.PLAY_VIDEO;
