@@ -18,5 +18,32 @@ contextBridge.exposeInMainWorld('assistant', {
 	/** @param {string} transcript */
 	utterance(transcript) {
 		return ipcRenderer.invoke('computer-control:utterance', transcript);
+	},
+	memory: {
+		/**
+		 * Call after every exchange; returns at once, fact extraction runs in the background.
+		 * @param {string} user
+		 * @param {string} assistant
+		 */
+		recordTurn(user, assistant) {
+			return ipcRenderer.invoke('memory:record-turn', { user, assistant });
+		},
+		/**
+		 * Chat messages with remembered facts and recent history already included.
+		 * @param {{ system?: string, user: string, history_messages?: number }} input
+		 */
+		buildMessages(input) {
+			return ipcRenderer.invoke('memory:build-messages', input);
+		},
+		context() {
+			return ipcRenderer.invoke('memory:context');
+		},
+		facts() {
+			return ipcRenderer.invoke('memory:facts');
+		},
+		/** @param {string} id */
+		forget(id) {
+			return ipcRenderer.invoke('memory:forget', id);
+		}
 	}
 });

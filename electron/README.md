@@ -3,45 +3,96 @@
 ```js
 // main.js
 import path from 'node:path';
-import { app, BrowserWindow, ipcMain, desktopCapturer, screen, systemPreferences } from 'electron';
-import { register_computer_control, start_renderer_server } from './computer-control/index.js';
+import {
+  app,
+  BrowserWindow,
+  ipcMain,
+  desktopCapturer,
+  screen,
+  systemPreferences,
+  powerMonitor
+} from 'electron';
+import {
+  claim_single_instance,
+  create_memory,
+  register_computer_control,
+  save_memory_on_exit,
+  start_renderer_server
+} from './computer-control/index.js';
 
 /** @type {BrowserWindow | null} */
 let win = null;
 
-app.whenReady().then(async () => {
-  // YouTube embeds fail on file:// (error 153), so serve the UI from http://127.0.0.1:<free port>
-  const server = await start_renderer_server(path.join(import.meta.dirname, 'renderer'));
-  app.on('will-quit', () => server.close());
+// 1. Before anything else: a second launch focuses this window and exits, so two processes
+//    never write the memory file at the same time.
+if (claim_single_instance(app, () => win)) {
+  // 2. Memory lives in ~/.tars/memory.json (or TARS_MEMORY_DIR), not in %APPDATA%.
+  const memory = create_memory({ warn: console.warn });
+  // 3. Save synchronously on quit / window close / log-off / shutdown / Ctrl+C.
+  save_memory_on_exit({ app, memory, powerMonitor });
 
-  win = new BrowserWindow({
-    width: 1100,
-    height: 750,
-    webPreferences: {
-      preload: path.join(import.meta.dirname, 'preload.cjs'),
-      contextIsolation: true,
-      sandbox: true,
-      // let "play a video about X" start with sound without a click
-      autoplayPolicy: 'no-user-gesture-required',
-      // keep voice recognition and playback running while minimized
-      backgroundThrottling: false
-    }
-  });
-  win.loadURL(server.url);
+  app.whenReady().then(async () => {
+    // YouTube embeds fail on file:// (error 153), so serve the UI from http://127.0.0.1:<free port>
+    const server = await start_renderer_server(path.join(import.meta.dirname, 'renderer'));
+    app.on('will-quit', () => server.close());
 
-  register_computer_control({
-    app,
-    ipcMain,
-    get_window: () => win,
-    desktopCapturer,
-    screen,
-    systemPreferences,
-    speak: (text) => {
-      /* your TARS voice */
-    }
+    win = new BrowserWindow({
+      width: 1100,
+      height: 750,
+      webPreferences: {
+        preload: path.join(import.meta.dirname, 'preload.cjs'),
+        contextIsolation: true,
+        sandbox: true,
+        // let "play a video about X" start with sound without a click
+        autoplayPolicy: 'no-user-gesture-required',
+        // keep voice recognition and playback running while minimized
+        backgroundThrottling: false
+      }
+    });
+    win.loadURL(server.url);
+
+    register_computer_control({
+      app,
+      ipcMain,
+      get_window: () => win,
+      desktopCapturer,
+      screen,
+      systemPreferences,
+      memory,
+      speak: (text) => {
+        /* your TARS voice */
+      }
+    });
   });
-});
+}
 ```
+
+## Memory
+
+In the renderer, for every turn of the normal conversation:
+
+```js
+// build the request with remembered facts + recent history already in it
+const messages = await window.assistant.memory.buildMessages({
+  system: TARS_PROMPT,
+  user: transcript
+});
+const reply = await callYourModel(messages);
+speak(reply);
+// returns at once; fact extraction runs in the background and never delays the voice
+window.assistant.memory.recordTurn(transcript, reply);
+```
+
+If your model call happens in the main process instead, use `memory.build_messages()` and
+`memory.record_turn()` directly. Screen analysis gets the facts automatically, and commands
+handled by `utterance()` are added to the history (without fact extraction).
+
+`memory.json` holds `{ conversation: [...], facts: [...] }`. Each save writes a temp file,
+copies the current file to `memory.json.bak`, then renames the temp file into place. If the
+main file is ever unreadable, the backup is loaded and the damaged file is kept as
+`memory.json.corrupt-<time>`.
+
+## Voice commands
 
 In the renderer, send each voice transcript to `window.assistant.utterance(text)` first. It
 handles screen requests and video commands (and speaks the reply); it returns `null` for

@@ -32,6 +32,7 @@ Answer that directly, using the screenshot as context. Don't describe the screen
  * @property {string} [persona] System prompt describing the assistant's voice. Defaults to {@link TARS_PERSONA}.
  * @property {typeof fetch} [fetch]
  * @property {number} [timeout_ms]
+ * @property {() => string} [context] Extra system-prompt text for every call, e.g. remembered facts.
  */
 
 export class VisionError extends Error {}
@@ -64,7 +65,12 @@ export async function ask_vision_model(shots, question, options = {}) {
 		temperature: 0.7,
 		max_completion_tokens: 400,
 		messages: [
-			{ role: 'system', content: options.persona ?? TARS_PERSONA },
+			{
+				role: 'system',
+				content: [options.persona ?? TARS_PERSONA, safe_context(options.context)]
+					.filter(Boolean)
+					.join('\n\n')
+			},
 			{
 				role: 'user',
 				content: [
@@ -121,6 +127,17 @@ export async function ask_vision_model(shots, question, options = {}) {
 		throw new VisionError('The vision model came back with nothing to say.');
 	}
 	return for_speech(text);
+}
+
+/**
+ * @param {(() => string) | undefined} context
+ */
+function safe_context(context) {
+	try {
+		return context?.() ?? '';
+	} catch {
+		return '';
+	}
 }
 
 /**

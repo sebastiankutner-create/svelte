@@ -12,6 +12,7 @@ import { is_video_id, search_youtube, YouTubeSearchError } from './youtube-searc
 /** @import { ScreenAnalyzerOptions, VisionOptions } from './screen-vision.js' */
 /** @import { CaptureDeps } from './screen-capture.js' */
 /** @import { VideoResult } from './youtube-search.js' */
+/** @import { Memory } from './memory.js' */
 
 export { ACTIONS, canonIntent } from './canon-intent.js';
 export { fill_link, load_apps, match_app } from './apps.js';
@@ -23,6 +24,9 @@ export { capture_all_screens } from './screen-capture.js';
 export { parse_video_command, parse_volume } from './video-intent.js';
 export { extract_first_video, search_url, search_youtube } from './youtube-search.js';
 export { start_renderer_server } from './loopback-server.js';
+export { create_memory, DEFAULT_MEMORY_MODEL } from './memory.js';
+export { default_memory_dir, read_memory, write_memory } from './memory-store.js';
+export { claim_single_instance, save_memory_on_exit } from './lifecycle.js';
 export {
 	ask_vision_model,
 	create_screen_analyzer,
@@ -42,6 +46,13 @@ const VIDEO_ACTIONS = new Set([
 
 export const IPC_CHANNEL = 'computer-control:run';
 export const UTTERANCE_CHANNEL = 'computer-control:utterance';
+export const MEMORY_CHANNELS = /** @type {const} */ ({
+	record_turn: 'memory:record-turn',
+	build_messages: 'memory:build-messages',
+	context: 'memory:context',
+	facts: 'memory:facts',
+	forget: 'memory:forget'
+});
 /** main → renderer channel carrying {@link VideoMessage}s */
 export const VIDEO_CHANNEL = 'assistant:video';
 
@@ -435,7 +446,7 @@ export function create_computer_control(options) {
  *
  * @param {{
  *   app: { getPath(name: 'userData'): string },
- *   ipcMain: { handle(channel: string, listener: (event: unknown, arg: any) => Promise<RunResult | null>): void },
+ *   ipcMain: { handle(channel: string, listener: (event: unknown, arg: any) => Promise<unknown>): void },
  *   get_window?: () => { isDestroyed(): boolean, webContents: { send(channel: string, ...args: unknown[]): void } } | null | undefined,
  *   desktopCapturer?: CaptureDeps['desktopCapturer'],
  *   screen?: CaptureDeps['screen'],
@@ -443,6 +454,7 @@ export function create_computer_control(options) {
  *   speak?: (text: string) => unknown,
  *   vision?: VisionOptions,
  *   search?: VideoOptions['search'],
+ *   memory?: Memory,
  *   warn?: (message: string) => void
  * }} electron
  */
@@ -456,6 +468,7 @@ export function register_computer_control({
 	speak,
 	vision,
 	search,
+	memory,
 	warn
 }) {
 	const control = create_computer_control({
@@ -463,7 +476,12 @@ export function register_computer_control({
 		warn,
 		screen:
 			desktopCapturer && screen
-				? { ...vision, speak, capture: { desktopCapturer, screen, systemPreferences } }
+				? {
+						...vision,
+						context: vision?.context ?? memory?.context_block,
+						speak,
+						capture: { desktopCapturer, screen, systemPreferences }
+					}
 				: undefined,
 		video: get_window
 			? {
@@ -483,7 +501,28 @@ export function register_computer_control({
 	control.apps();
 
 	ipcMain.handle(IPC_CHANNEL, (_event, command) => control.run(command));
-	ipcMain.handle(UTTERANCE_CHANNEL, (_event, text) => control.handle_utterance(text));
+	ipcMain.handle(UTTERANCE_CHANNEL, async (_event, text) => {
+		const result = await control.handle_utterance(text);
+		// keep commands handled here in the conversation history too (no fact extraction:
+		// "pause the video" or a screen description isn't something to remember)
+		if (result && memory)
+			memory.record_turn(text, result.ok ? result.message : result.error, { extract: false });
+		return result;
+	});
+
+	if (memory) {
+		ipcMain.handle(MEMORY_CHANNELS.record_turn, (_event, turn) => {
+			memory.record_turn(turn?.user, turn?.assistant, { extract: turn?.extract !== false });
+			return Promise.resolve(null);
+		});
+		ipcMain.handle(MEMORY_CHANNELS.build_messages, (_event, input) =>
+			Promise.resolve(memory.build_messages(input))
+		);
+		ipcMain.handle(MEMORY_CHANNELS.context, () => Promise.resolve(memory.context_block()));
+		ipcMain.handle(MEMORY_CHANNELS.facts, () => Promise.resolve(memory.facts()));
+		ipcMain.handle(MEMORY_CHANNELS.forget, (_event, id) => Promise.resolve(memory.forget(id)));
+	}
+
 	return control;
 }
 
