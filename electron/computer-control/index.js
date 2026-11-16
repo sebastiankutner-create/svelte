@@ -13,6 +13,7 @@ import { is_video_id, search_youtube, YouTubeSearchError } from './youtube-searc
 /** @import { CaptureDeps } from './screen-capture.js' */
 /** @import { VideoResult } from './youtube-search.js' */
 /** @import { Memory } from './memory.js' */
+/** @import { MissionLog } from './mission-log.js' */
 
 export { ACTIONS, canonIntent } from './canon-intent.js';
 export { fill_link, load_apps, match_app } from './apps.js';
@@ -24,7 +25,12 @@ export { capture_all_screens } from './screen-capture.js';
 export { parse_video_command, parse_volume } from './video-intent.js';
 export { extract_first_video, search_url, search_youtube } from './youtube-search.js';
 export { start_renderer_server } from './loopback-server.js';
-export { create_memory, DEFAULT_MEMORY_MODEL } from './memory.js';
+export { create_memory, DEFAULT_MEMORY_MODEL, ExtractionError } from './memory.js';
+export {
+	create_mission_log,
+	MISSION_LOG_CHANNEL,
+	MISSION_LOG_HISTORY_CHANNEL
+} from './mission-log.js';
 export { default_memory_dir, read_memory, write_memory } from './memory-store.js';
 export { claim_single_instance, save_memory_on_exit } from './lifecycle.js';
 export {
@@ -455,6 +461,7 @@ export function create_computer_control(options) {
  *   vision?: VisionOptions,
  *   search?: VideoOptions['search'],
  *   memory?: Memory,
+ *   mission_log?: MissionLog,
  *   warn?: (message: string) => void
  * }} electron
  */
@@ -469,6 +476,7 @@ export function register_computer_control({
 	vision,
 	search,
 	memory,
+	mission_log,
 	warn
 }) {
 	const control = create_computer_control({
@@ -509,6 +517,8 @@ export function register_computer_control({
 			memory.record_turn(text, result.ok ? result.message : result.error, { extract: false });
 		return result;
 	});
+
+	mission_log?.register_ipc(ipcMain);
 
 	if (memory) {
 		ipcMain.handle(MEMORY_CHANNELS.record_turn, (_event, turn) => {

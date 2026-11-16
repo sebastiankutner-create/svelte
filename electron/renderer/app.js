@@ -1,4 +1,5 @@
 import { create_youtube_player } from './youtube-player.js';
+import { create_mission_log_view } from './mission-log-view.js';
 
 /**
  * @typedef {{ type: 'load', video_id: string, title?: string | null }
@@ -18,3 +19,12 @@ const player = create_youtube_player(container);
 		player.command(message.func, message.args ?? []);
 	}
 });
+
+const mission_log = create_mission_log_view(
+	/** @type {HTMLOListElement} */ (document.querySelector('#mission-log'))
+);
+const bridge = /** @type {any} */ (window).assistant?.missionLog;
+if (bridge) {
+	bridge.onEntry(mission_log.add);
+	bridge.history().then((/** @type {any[]} */ entries) => entries.forEach(mission_log.add));
+}

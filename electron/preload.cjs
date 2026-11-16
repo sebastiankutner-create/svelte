@@ -19,6 +19,19 @@ contextBridge.exposeInMainWorld('assistant', {
 	utterance(transcript) {
 		return ipcRenderer.invoke('computer-control:utterance', transcript);
 	},
+	missionLog: {
+		/** @param {(entry: unknown) => void} callback */
+		onEntry(callback) {
+			ipcRenderer.on(
+				'assistant:mission-log',
+				(/** @type {unknown} */ _event, /** @type {unknown} */ entry) => callback(entry)
+			);
+		},
+		/** Entries logged before this window started listening. */
+		history() {
+			return ipcRenderer.invoke('mission-log:history');
+		}
+	},
 	memory: {
 		/**
 		 * Call after every exchange; returns at once, fact extraction runs in the background.

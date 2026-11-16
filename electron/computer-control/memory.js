@@ -1,6 +1,8 @@
 import process from 'node:process';
 import { default_memory_dir, read_memory, write_memory } from './memory-store.js';
 
+/** @import { Logger } from './mission-log.js' */
+
 /** @import { Fact, MemoryData, Message } from './memory-store.js' */
 
 export const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
@@ -35,7 +37,8 @@ Use empty arrays when there is nothing to change, which is the usual case.`;
  * @property {string} [model] Defaults to `process.env.GROQ_MEMORY_MODEL`, then {@link DEFAULT_MEMORY_MODEL}.
  * @property {typeof fetch} [fetch]
  * @property {number} [timeout_ms]
- * @property {(message: string) => void} [warn]
+ * @property {Logger} [log] Receives structured failure entries, e.g. `mission_log.log`.
+ * @property {(message: string) => void} [warn] Plain-text alternative to `log`.
  * @property {() => Date} [now]
  */
 
@@ -46,10 +49,28 @@ export function create_memory(options = {}) {
 	const dir = options.dir ?? default_memory_dir();
 	const debounce_ms = options.debounce_ms ?? 500;
 	const warn = options.warn ?? (() => {});
+	/** @type {Logger} */
+	const log = (entry) => {
+		try {
+			if (options.log) options.log(entry);
+			else warn(`memory: ${entry.message}`);
+		} catch {
+			// a broken logger must not break memory
+		}
+	};
+	let warned_no_key = false;
 	const now = options.now ?? (() => new Date());
 
 	const loaded = read_memory(dir);
-	if (loaded.warning) warn(`memory: ${loaded.warning}`);
+	if (loaded.warning) {
+		log({
+			level: loaded.source === 'empty' ? 'error' : 'warn',
+			source: 'memory',
+			event: 'load_recovered',
+			message: `Memory file problem: ${loaded.warning}`,
+			detail: { dir, loaded_from: loaded.source }
+		});
+	}
 
 	/** @type {MemoryData} */
 	const data = loaded.data;
@@ -78,7 +99,14 @@ export function create_memory(options = {}) {
 			write_memory(dir, data);
 			dirty = false;
 		} catch (e) {
-			warn(`memory: save failed: ${/** @type {Error} */ (e).message}`);
+			const error = /** @type {NodeJS.ErrnoException} */ (e);
+			log({
+				level: 'error',
+				source: 'memory',
+				event: 'save_failed',
+				message: `Couldn't save memory: ${error.message}`,
+				detail: { dir, code: error.code }
+			});
 		}
 	}
 
@@ -111,14 +139,25 @@ export function create_memory(options = {}) {
 		touch();
 
 		if (opts.extract !== false && !closed) {
-			// fire-and-forget: errors are logged, never thrown, never awaited by the caller
+			// fire-and-forget: failures go to the log, never to the caller, never awaited
 			extraction_chain = extraction_chain
 				.then(() => new Promise((resolve) => setImmediate(resolve)))
 				.then(() => extract_facts(user, assistant))
-				.catch((e) =>
-					warn(`memory: fact extraction failed: ${/** @type {Error} */ (e)?.message ?? e}`)
-				);
+				.catch((e) => log_extraction_failure(e));
 		}
+	}
+
+	/** @param {unknown} e */
+	function log_extraction_failure(e) {
+		const error =
+			e instanceof ExtractionError ? e : new ExtractionError('unexpected', describe(e), {});
+		log({
+			level: 'error',
+			source: 'memory',
+			event: 'extraction_failed',
+			message: `Fact extraction failed: ${error.message}`,
+			detail: { kind: error.kind, ...error.detail }
+		});
 	}
 
 	/**
@@ -127,48 +166,137 @@ export function create_memory(options = {}) {
 	 */
 	async function extract_facts(user, assistant) {
 		const api_key = options.api_key ?? process.env.GROQ_API_KEY;
-		if (!api_key) return;
+		if (!api_key) {
+			if (!warned_no_key) {
+				warned_no_key = true;
+				log({
+					level: 'warn',
+					source: 'memory',
+					event: 'extraction_disabled',
+					message: 'Fact extraction is off: GROQ_API_KEY is not set. Conversations are still saved.'
+				});
+			}
+			return;
+		}
 
 		const model = options.model ?? process.env.GROQ_MEMORY_MODEL ?? DEFAULT_MEMORY_MODEL;
 		const do_fetch = options.fetch ?? fetch;
+		const timeout_ms = options.timeout_ms ?? 30_000;
+		const started = Date.now();
 		const payload = JSON.stringify({
 			known_facts: data.facts.map((f) => ({ id: f.id, text: f.text })),
 			exchange: { user, assistant }
 		});
 
-		/** @param {boolean} json_mode */
-		const request = (json_mode) =>
-			do_fetch(GROQ_URL, {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${api_key}` },
-				body: JSON.stringify({
-					model,
-					temperature: 0.2,
-					max_completion_tokens: 1024,
-					...(json_mode ? { response_format: { type: 'json_object' } } : {}),
-					messages: [
-						{ role: 'system', content: EXTRACT_PROMPT },
-						{ role: 'user', content: payload }
-					]
-				}),
-				signal: AbortSignal.timeout(options.timeout_ms ?? 30_000)
-			});
+		/** @param {Record<string, unknown>} [extra] */
+		const detail = (extra) => ({ model, duration_ms: Date.now() - started, ...extra });
+
+		/**
+		 * @param {boolean} json_mode
+		 * @returns {Promise<Response>}
+		 */
+		const request = async (json_mode) => {
+			try {
+				return await do_fetch(GROQ_URL, {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${api_key}` },
+					body: JSON.stringify({
+						model,
+						temperature: 0.2,
+						max_completion_tokens: 1024,
+						...(json_mode ? { response_format: { type: 'json_object' } } : {}),
+						messages: [
+							{ role: 'system', content: EXTRACT_PROMPT },
+							{ role: 'user', content: payload }
+						]
+					}),
+					signal: AbortSignal.timeout(timeout_ms)
+				});
+			} catch (e) {
+				const name = /** @type {Error} */ (e)?.name;
+				if (name === 'TimeoutError' || name === 'AbortError') {
+					throw new ExtractionError(
+						'timeout',
+						`Groq didn't answer within ${timeout_ms / 1000}s`,
+						detail()
+					);
+				}
+				throw new ExtractionError('network', `couldn't reach Groq (${describe(e)})`, detail());
+			}
+		};
 
 		let response = await request(true);
 		if (response.status === 400) {
 			// some models reject JSON mode; the prompt alone asks for JSON
-			const body = await response.text().catch(() => '');
-			if (/response_format|json/i.test(body)) response = await request(false);
-			else throw new Error(`Groq returned 400: ${body.slice(0, 200)}`);
+			const body = await response
+				.clone()
+				.text()
+				.catch(() => '');
+			if (/response_format|json_object|json mode/i.test(body)) response = await request(false);
 		}
-		if (!response.ok) throw new Error(`Groq returned HTTP ${response.status}`);
 
-		const json = /** @type {any} */ (await response.json());
+		if (!response.ok) {
+			const body = await response.text().catch(() => '');
+			/** @type {any} */
+			let parsed = null;
+			try {
+				parsed = JSON.parse(body);
+			} catch {
+				// not JSON
+			}
+			const api_message =
+				parsed?.error?.message ?? (body.slice(0, 200) || response.statusText || '');
+			const code = parsed?.error?.code;
+			const info = detail({
+				status: response.status,
+				code,
+				request_id: response.headers?.get?.('x-request-id') ?? undefined
+			});
+			const reason =
+				response.status === 401 || response.status === 403
+					? 'Groq rejected the API key'
+					: response.status === 429
+						? 'Groq rate limit reached'
+						: code === 'model_decommissioned' || code === 'model_not_found'
+							? `model "${model}" isn't available (set GROQ_MEMORY_MODEL)`
+							: `Groq returned HTTP ${response.status}`;
+			throw new ExtractionError('http', api_message ? `${reason}: ${api_message}` : reason, info);
+		}
+
+		/** @type {any} */
+		let json;
+		try {
+			json = await response.json();
+		} catch (e) {
+			throw new ExtractionError(
+				'bad_response',
+				`Groq's response wasn't valid JSON (${describe(e)})`,
+				detail()
+			);
+		}
+
 		const text = json?.choices?.[0]?.message?.content;
-		if (typeof text !== 'string') return;
+		if (typeof text !== 'string' || text.trim() === '') {
+			const finish_reason = json?.choices?.[0]?.finish_reason;
+			throw new ExtractionError(
+				'empty_output',
+				finish_reason === 'length'
+					? 'the model ran out of tokens before answering'
+					: 'the model returned no text',
+				detail({ finish_reason })
+			);
+		}
 
 		const changes = parse_changes(text);
-		if (changes && !closed) apply_changes(changes);
+		if (!changes) {
+			throw new ExtractionError(
+				'bad_output',
+				"the model's answer wasn't the expected JSON",
+				detail({ output: text.length > 200 ? `${text.slice(0, 200)}…` : text })
+			);
+		}
+
+		if (!closed) apply_changes(changes);
 	}
 
 	/**
@@ -295,6 +423,29 @@ export function create_memory(options = {}) {
 }
 
 /** @typedef {ReturnType<typeof create_memory>} Memory */
+
+export class ExtractionError extends Error {
+	/**
+	 * @param {'network' | 'timeout' | 'http' | 'bad_response' | 'empty_output' | 'bad_output' | 'unexpected'} kind
+	 * @param {string} message
+	 * @param {Record<string, unknown>} detail
+	 */
+	constructor(kind, message, detail) {
+		super(message);
+		this.name = 'ExtractionError';
+		this.kind = kind;
+		this.detail = detail;
+	}
+}
+
+/** @param {unknown} e */
+function describe(e) {
+	if (e instanceof Error) {
+		const cause = /** @type {any} */ (e).cause;
+		return cause?.code ? `${e.message}: ${cause.code}` : e.message;
+	}
+	return String(e);
+}
 
 /**
  * @param {string} text

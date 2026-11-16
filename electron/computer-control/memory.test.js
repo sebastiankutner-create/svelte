@@ -9,6 +9,7 @@ import {
 	ask_vision_model,
 	claim_single_instance,
 	create_memory,
+	create_mission_log,
 	DEFAULT_MEMORY_MODEL,
 	default_memory_dir,
 	read_memory,
@@ -39,12 +40,19 @@ function fake_groq(...replies) {
 		const body = reply?.status
 			? reply.body
 			: { choices: [{ message: { content: JSON.stringify(reply) } }] };
-		return Promise.resolve({
+		const make = () => ({
 			ok: status < 400,
 			status,
-			json: () => Promise.resolve(body),
-			text: () => Promise.resolve(typeof body === 'string' ? body : JSON.stringify(body))
+			statusText: '',
+			headers: new Headers(reply?.headers ?? {}),
+			json: () =>
+				typeof body === 'string'
+					? Promise.reject(new SyntaxError('Unexpected token'))
+					: Promise.resolve(body),
+			text: () => Promise.resolve(typeof body === 'string' ? body : JSON.stringify(body)),
+			clone: make
 		});
+		return Promise.resolve(make());
 	};
 	return { fetch, requests };
 }
@@ -262,8 +270,225 @@ test('extraction failures are logged, never thrown', async () => {
 	await memory.idle();
 	assert.equal(memory.facts().length, 0);
 	assert.equal(memory.conversation().length, 6);
-	assert.equal(warnings.length, 2);
-	assert.match(warnings[0], /offline/);
+	assert.deepEqual(warnings, [
+		"memory: Fact extraction failed: couldn't reach Groq (offline)",
+		'memory: Fact extraction failed: Groq returned HTTP 500: {}',
+		"memory: Fact extraction failed: the model's answer wasn't the expected JSON"
+	]);
+});
+
+/**
+ * Run one extraction against a fake Groq reply and return what reached the mission log.
+ * @param {any} reply
+ * @param {Partial<Parameters<typeof create_memory>[0]>} [options]
+ */
+async function log_for(reply, options = {}) {
+	/** @type {any[]} */
+	const printed = [];
+	const log = create_mission_log({ print: (line) => printed.push(line) });
+	const memory = create_memory({
+		dir: temp_dir(),
+		api_key: 'k',
+		fetch: fake_groq(reply).fetch,
+		log: log.log,
+		...options
+	});
+	memory.record_turn('I like tea', 'Noted');
+	await memory.idle();
+	return { entries: log.entries(), printed };
+}
+
+test('each kind of extraction failure reaches the mission log with details', async () => {
+	/** @type {Error & { cause?: unknown }} */
+	const network = new TypeError('fetch failed');
+	network.cause = { code: 'ENOTFOUND' };
+
+	/** @type {Array<[any, string, string, Record<string, unknown>]>} */
+	const cases = [
+		[
+			network,
+			'network',
+			"Fact extraction failed: couldn't reach Groq (fetch failed: ENOTFOUND)",
+			{}
+		],
+		[
+			Object.assign(new Error('The operation was aborted due to timeout'), {
+				name: 'TimeoutError'
+			}),
+			'timeout',
+			"Fact extraction failed: Groq didn't answer within 30s",
+			{}
+		],
+		[
+			{
+				status: 401,
+				body: { error: { message: 'Invalid API Key', code: 'invalid_api_key' } },
+				headers: { 'x-request-id': 'req_123' }
+			},
+			'http',
+			'Fact extraction failed: Groq rejected the API key: Invalid API Key',
+			{ status: 401, code: 'invalid_api_key', request_id: 'req_123' }
+		],
+		[
+			{ status: 429, body: { error: { message: 'Rate limit reached for model' } } },
+			'http',
+			'Fact extraction failed: Groq rate limit reached: Rate limit reached for model',
+			{ status: 429 }
+		],
+		[
+			{
+				status: 404,
+				body: { error: { message: 'The model does not exist', code: 'model_not_found' } }
+			},
+			'http',
+			`Fact extraction failed: model "${DEFAULT_MEMORY_MODEL}" isn't available (set GROQ_MEMORY_MODEL): The model does not exist`,
+			{ status: 404, code: 'model_not_found' }
+		],
+		[
+			{ status: 502, body: '<html>Bad gateway</html>' },
+			'http',
+			'Fact extraction failed: Groq returned HTTP 502: <html>Bad gateway</html>',
+			{ status: 502 }
+		],
+		[
+			{ status: 200, body: '<html>captive portal</html>' },
+			'bad_response',
+			"Fact extraction failed: Groq's response wasn't valid JSON (Unexpected token)",
+			{}
+		],
+		[
+			{ status: 200, body: { choices: [{ message: { content: '' }, finish_reason: 'length' }] } },
+			'empty_output',
+			'Fact extraction failed: the model ran out of tokens before answering',
+			{ finish_reason: 'length' }
+		],
+		[
+			{ status: 200, body: { choices: [{ message: { content: 'I think the user likes tea.' } }] } },
+			'bad_output',
+			"Fact extraction failed: the model's answer wasn't the expected JSON",
+			{ output: 'I think the user likes tea.' }
+		]
+	];
+
+	for (const [reply, kind, message, detail] of cases) {
+		const { entries, printed } = await log_for(reply);
+		assert.equal(entries.length, 1, message);
+		const [entry] = entries;
+		assert.equal(entry.level, 'error');
+		assert.equal(entry.source, 'memory');
+		assert.equal(entry.event, 'extraction_failed');
+		assert.equal(entry.message, message);
+		assert.equal(entry.detail?.kind, kind);
+		assert.equal(entry.detail?.model, DEFAULT_MEMORY_MODEL);
+		assert.equal(typeof entry.detail?.duration_ms, 'number');
+		for (const [key, value] of Object.entries(detail))
+			assert.equal(entry.detail?.[key], value, `${message}: ${key}`);
+		assert.match(printed[0], /ERROR memory\/extraction_failed: /);
+	}
+});
+
+test('a successful extraction logs nothing', async () => {
+	const { entries } = await log_for({ add: ['The user likes tea.'], update: [], remove: [] });
+	assert.deepEqual(entries, []);
+});
+
+test('a missing API key is logged once, not on every turn', async () => {
+	const saved = process.env.GROQ_API_KEY;
+	delete process.env.GROQ_API_KEY;
+	try {
+		const log = create_mission_log({ print: () => {} });
+		const memory = create_memory({
+			dir: temp_dir(),
+			fetch: fake_groq(NOTHING).fetch,
+			log: log.log
+		});
+		memory.record_turn('a', 'b');
+		memory.record_turn('c', 'd');
+		await memory.idle();
+		assert.deepEqual(
+			log.entries().map((e) => [e.level, e.event]),
+			[['warn', 'extraction_disabled']]
+		);
+	} finally {
+		if (saved !== undefined) process.env.GROQ_API_KEY = saved;
+	}
+});
+
+test('save failures and recovered memory files are logged too', () => {
+	const dir = temp_dir();
+	fs.writeFileSync(path.join(dir, 'memory.json'), '{ broken');
+	const log = create_mission_log({ print: () => {} });
+	const memory = create_memory({ dir, log: log.log, debounce_ms: 60_000 });
+	assert.deepEqual(
+		log.entries().map((e) => [e.level, e.event]),
+		[['error', 'load_recovered']]
+	);
+
+	// make the folder unwritable by replacing it with a file
+	fs.rmSync(dir, { recursive: true });
+	fs.writeFileSync(dir, 'not a folder');
+	memory.record_turn('a', 'b', { extract: false });
+	memory.flush();
+	const last = log.entries().at(-1);
+	assert.equal(last?.event, 'save_failed');
+	assert.match(last?.message ?? '', /^Couldn't save memory: /);
+	fs.rmSync(dir);
+});
+
+test('a broken logger never breaks memory', async () => {
+	const memory = create_memory({
+		dir: temp_dir(),
+		api_key: 'k',
+		fetch: fake_groq(new Error('offline')).fetch,
+		log: () => {
+			throw new Error('logger exploded');
+		}
+	});
+	memory.record_turn('a', 'b');
+	await memory.idle();
+	assert.equal(memory.conversation().length, 2);
+});
+
+test('the mission log forwards entries to the window and replays history', async () => {
+	/** @type {any[]} */
+	const sent = [];
+	let open = false;
+	const log = create_mission_log({
+		print: () => {},
+		max_entries: 3,
+		get_window: () =>
+			open
+				? {
+						isDestroyed: () => false,
+						webContents: { send: (channel, entry) => sent.push([channel, entry]) }
+					}
+				: null
+	});
+
+	log.log({ level: 'error', source: 'memory', event: 'a', message: 'before the window opened' });
+	open = true;
+	log.log({ level: 'warn', source: 'memory', event: 'b', message: 'live' });
+	assert.equal(sent.length, 1);
+	assert.equal(sent[0][0], 'assistant:mission-log');
+	assert.equal(sent[0][1].message, 'live');
+	assert.equal(sent[0][1].id, 2);
+
+	/** @type {Map<string, Function>} */
+	const handlers = new Map();
+	log.register_ipc({ handle: (channel, fn) => handlers.set(channel, fn) });
+	const history = await /** @type {Function} */ (handlers.get('mission-log:history'))();
+	assert.deepEqual(
+		history.map((/** @type {any} */ e) => e.message),
+		['before the window opened', 'live']
+	);
+
+	log.log({ level: 'info', source: 'x', event: 'c', message: '3' });
+	log.log({ level: 'info', source: 'x', event: 'd', message: '4' });
+	assert.deepEqual(
+		log.entries().map((e) => e.id),
+		[2, 3, 4],
+		'oldest entries are dropped past max_entries'
+	);
 });
 
 test('models without JSON mode are retried without it', async () => {
