@@ -1,0 +1,12 @@
+{
+  "name": "tars-assistant",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test computer-control/*.test.js"
+  },
+  "dependencies": {
+    "docx": "^9.15.4",
+    "pdfkit": "^0.20.2"
+  }
+}
