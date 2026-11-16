@@ -15,6 +15,7 @@ import {
 import {
   claim_single_instance,
   create_memory,
+  create_mission_log,
   register_computer_control,
   save_memory_on_exit,
   start_renderer_server
@@ -26,9 +27,12 @@ let win = null;
 // 1. Before anything else: a second launch focuses this window and exits, so two processes
 //    never write the memory file at the same time.
 if (claim_single_instance(app, () => win)) {
-  // 2. Memory lives in ~/.tars/memory.json (or TARS_MEMORY_DIR), not in %APPDATA%.
-  const memory = create_memory({ warn: console.warn });
-  // 3. Save synchronously on quit / window close / log-off / shutdown / Ctrl+C.
+  // 2. The mission log: failures from background work, shown in the window and printed to stderr.
+  const mission_log = create_mission_log({ get_window: () => win });
+  // 3. Memory lives in ~/.tars/memory.json (or TARS_MEMORY_DIR), not in %APPDATA%.
+  //    Fact-extraction, save and load failures are reported to the mission log.
+  const memory = create_memory({ log: mission_log.log });
+  // 4. Save synchronously on quit / window close / log-off / shutdown / Ctrl+C.
   save_memory_on_exit({ app, memory, powerMonitor });
 
   app.whenReady().then(async () => {
@@ -59,6 +63,7 @@ if (claim_single_instance(app, () => win)) {
       screen,
       systemPreferences,
       memory,
+      mission_log,
       speak: (text) => {
         /* your TARS voice */
       }
@@ -110,3 +115,34 @@ go to `window.assistant.run(command)`.
 | "set volume to X"                      | sends `setVolume` (0–100; words like "forty" or "max" work too) |
 
 Tests: `node --test electron/computer-control/*.test.js`
+
+## Mission log
+
+Background work that nobody is waiting on (fact extraction, memory saves) reports failures
+to the mission log instead of failing silently. Each entry looks like:
+
+```json
+{
+  "id": 7,
+  "at": "2026-11-16T14:03:07.000Z",
+  "level": "error",
+  "source": "memory",
+  "event": "extraction_failed",
+  "message": "Fact extraction failed: Groq rate limit reached: Rate limit reached for model",
+  "detail": {
+    "kind": "http",
+    "status": 429,
+    "model": "openai/gpt-oss-20b",
+    "duration_ms": 412,
+    "request_id": "req_..."
+  }
+}
+```
+
+`detail.kind` is one of `network`, `timeout`, `http`, `bad_response`, `empty_output`,
+`bad_output` or `unexpected`. A missing `GROQ_API_KEY` is logged once as a warning; memory
+load recoveries and save failures are logged as `load_recovered` / `save_failed`.
+
+In the renderer, `window.assistant.missionLog.onEntry(cb)` delivers live entries and
+`missionLog.history()` returns the last 200 (including ones logged before the window
+loaded). `renderer/mission-log-view.js` renders them; point it at your own list element.
