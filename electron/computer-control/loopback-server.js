@@ -122,3 +122,84 @@ function send(res, status, message) {
 	res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8' });
 	res.end(message);
 }
+
+/**
+ * @typedef {{
+ *   loadURL(url: string): Promise<void>,
+ *   once(event: 'closed', listener: () => void): unknown,
+ *   webContents: {
+ *     on(event: 'will-navigate' | 'will-redirect', listener: (event: { url?: string, preventDefault(): void }, url?: string) => void): unknown,
+ *     setWindowOpenHandler(handler: (details: { url: string }) => { action: 'deny' } | { action: 'allow' }): void
+ *   }
+ * }} WindowLike
+ */
+
+/**
+ * Load the assistant UI into `win` from `http://127.0.0.1:<free port>/` instead of
+ * `win.loadFile()` / `file://`. Replaces:
+ *
+ * ```js
+ * win.loadFile('renderer/index.html');                       // before
+ * await load_renderer(win, path.join(import.meta.dirname, 'renderer'), {
+ *   open_external: (url) => shell.openExternal(url)          // after
+ * });
+ * ```
+ *
+ * The window is kept on that origin: navigating anywhere else (including `file://`) is
+ * blocked, and web links go to `open_external` (the user's browser) instead. The server stops
+ * when the window is closed.
+ *
+ * @param {WindowLike} win
+ * @param {string} root Folder with `index.html`.
+ * @param {{ port?: number, csp?: string, open_external?: (url: string) => unknown }} [options]
+ * @returns {Promise<RendererServer>}
+ */
+export async function load_renderer(win, root, options = {}) {
+	if (!fs.existsSync(path.join(root, 'index.html'))) {
+		throw new Error(`Can't load the assistant UI: there is no index.html in ${path.resolve(root)}`);
+	}
+
+	const server = await start_renderer_server(root, options);
+
+	/** @param {string | undefined} url */
+	const is_ours = (url) => {
+		try {
+			return new URL(url ?? '').origin === server.origin;
+		} catch {
+			return false;
+		}
+	};
+	/** @param {string | undefined} url */
+	const open_outside = (url) => {
+		if (url && /^https?:\/\//i.test(url)) {
+			try {
+				options.open_external?.(url);
+			} catch {
+				// ignore
+			}
+		}
+	};
+
+	/** @param {{ url?: string, preventDefault(): void }} event @param {string} [legacy_url] */
+	const guard = (event, legacy_url) => {
+		const url = event.url ?? legacy_url;
+		if (!is_ours(url)) {
+			event.preventDefault();
+			open_outside(url);
+		}
+	};
+	win.webContents.on('will-navigate', guard);
+	win.webContents.on('will-redirect', guard);
+	win.webContents.setWindowOpenHandler(({ url }) => {
+		// e.g. "Watch on YouTube" in the embed: open it in the browser, not a new Electron window
+		open_outside(url);
+		return { action: 'deny' };
+	});
+
+	win.once('closed', () => {
+		void server.close();
+	});
+
+	await win.loadURL(server.url);
+	return server;
+}

@@ -1,76 +1,27 @@
 # Assistant: Electron main-process wiring
 
+`main.js` is the complete main process. If your app already has its own, the one change the
+renderer needs is to stop loading from `file://`:
+
 ```js
-// main.js
-import path from 'node:path';
-import {
-  app,
-  BrowserWindow,
-  ipcMain,
-  desktopCapturer,
-  screen,
-  systemPreferences,
-  powerMonitor
-} from 'electron';
-import {
-  claim_single_instance,
-  create_memory,
-  create_mission_log,
-  register_computer_control,
-  save_memory_on_exit,
-  start_renderer_server
-} from './computer-control/index.js';
+import { shell } from 'electron';
+import { load_renderer } from './computer-control/index.js';
 
-/** @type {BrowserWindow | null} */
-let win = null;
-
-// 1. Before anything else: a second launch focuses this window and exits, so two processes
-//    never write the memory file at the same time.
-if (claim_single_instance(app, () => win)) {
-  // 2. The mission log: failures from background work, shown in the window and printed to stderr.
-  const mission_log = create_mission_log({ get_window: () => win });
-  // 3. Memory lives in ~/.tars/memory.json (or TARS_MEMORY_DIR), not in %APPDATA%.
-  //    Fact-extraction, save and load failures are reported to the mission log.
-  const memory = create_memory({ log: mission_log.log });
-  // 4. Save synchronously on quit / window close / log-off / shutdown / Ctrl+C.
-  save_memory_on_exit({ app, memory, powerMonitor });
-
-  app.whenReady().then(async () => {
-    // YouTube embeds fail on file:// (error 153), so serve the UI from http://127.0.0.1:<free port>
-    const server = await start_renderer_server(path.join(import.meta.dirname, 'renderer'));
-    app.on('will-quit', () => server.close());
-
-    win = new BrowserWindow({
-      width: 1100,
-      height: 750,
-      webPreferences: {
-        preload: path.join(import.meta.dirname, 'preload.cjs'),
-        contextIsolation: true,
-        sandbox: true,
-        // let "play a video about X" start with sound without a click
-        autoplayPolicy: 'no-user-gesture-required',
-        // keep voice recognition and playback running while minimized
-        backgroundThrottling: false
-      }
-    });
-    win.loadURL(server.url);
-
-    register_computer_control({
-      app,
-      ipcMain,
-      get_window: () => win,
-      desktopCapturer,
-      screen,
-      systemPreferences,
-      memory,
-      mission_log,
-      speak: (text) => {
-        /* your TARS voice */
-      }
-    });
-  });
-}
+// before: win.loadFile('renderer/index.html');
+await load_renderer(win, path.join(import.meta.dirname, 'renderer'), {
+  open_external: (url) => shell.openExternal(url)
+});
 ```
+
+`load_renderer()` serves the folder from `http://127.0.0.1:<free port>/` (bound to loopback
+only) and loads the window from there. YouTube embeds reject `file://` pages with error 153.
+It also keeps the window on that origin: navigation anywhere else, `file://` included, is
+blocked, and web links open in the user's browser. The server stops when the window closes.
+Pass `port` for a fixed port if you want `localStorage` to survive restarts.
+
+Order in `main.js`: claim the single-instance lock, create the mission log and memory, hook
+save-on-exit, then on `ready` create the window, call `register_computer_control()` and
+`load_renderer()`.
 
 ## Memory
 

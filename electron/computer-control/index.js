@@ -35,7 +35,7 @@ export { parse_screen_request } from './screen-intent.js';
 export { capture_all_screens } from './screen-capture.js';
 export { parse_video_command, parse_volume } from './video-intent.js';
 export { extract_first_video, search_url, search_youtube } from './youtube-search.js';
-export { start_renderer_server } from './loopback-server.js';
+export { load_renderer, start_renderer_server } from './loopback-server.js';
 export { parse_markdown, parse_inline, first_h1 } from './markdown-blocks.js';
 export {
 	blocks_to_text,

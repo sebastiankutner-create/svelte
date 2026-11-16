@@ -2,6 +2,7 @@
   "name": "tars-assistant",
   "private": true,
   "type": "module",
+  "main": "main.js",
   "scripts": {
     "test": "node --test computer-control/*.test.js"
   },
