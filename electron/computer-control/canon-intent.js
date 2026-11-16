@@ -6,7 +6,8 @@
 export const ACTIONS = /** @type {const} */ ({
 	OPEN_APP: 'open_app',
 	OPEN_URL: 'open_url',
-	LIST_APPS: 'list_apps'
+	LIST_APPS: 'list_apps',
+	ANALYZE_SCREEN: 'analyze_screen'
 });
 
 /** @typedef {typeof ACTIONS[keyof typeof ACTIONS]} Action */
@@ -57,6 +58,15 @@ const URL_WORDS = new Set([
 	'web'
 ]);
 
+const SCREEN_WORDS = new Set([
+	'screen',
+	'screens',
+	'screenshot',
+	'screenshots',
+	'monitor',
+	'monitors'
+]);
+
 const LIST_VERBS = new Set(['list', 'show', 'get', 'available', 'which', 'what', 'enumerate']);
 
 /**
@@ -97,6 +107,11 @@ export function canonIntent(raw) {
 	}
 
 	const has = (/** @type {Set<string>} */ set) => tokens.some((t) => set.has(t));
+
+	// "analyze my screen", "look at screen", "take screenshot", "what do you see"
+	if (has(SCREEN_WORDS) || /\bwhat (?:do|can) you see\b/.test(tokens.join(' '))) {
+		return ACTIONS.ANALYZE_SCREEN;
+	}
 
 	// "list apps", "show applications", "what apps are available"
 	if (has(LIST_VERBS) && has(APP_NOUNS) && !has(URL_WORDS) && !tokens.includes('open')) {

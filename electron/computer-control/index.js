@@ -1,18 +1,32 @@
 import { ACTIONS, canonIntent } from './canon-intent.js';
 import { fill_link, load_apps, match_app } from './apps.js';
 import { launch } from './launcher.js';
+import { parse_screen_request } from './screen-intent.js';
+import { create_screen_analyzer } from './screen-vision.js';
 
 /** @import { AppDefinition } from './default-apps.js' */
 /** @import { LinkDefinition } from './default-links.js' */
 /** @import { LaunchDeps } from './launcher.js' */
+/** @import { ScreenAnalyzerOptions, VisionOptions } from './screen-vision.js' */
+/** @import { CaptureDeps } from './screen-capture.js' */
 
 export { ACTIONS, canonIntent } from './canon-intent.js';
 export { fill_link, load_apps, match_app } from './apps.js';
 export { default_links, default_vars } from './default-links.js';
 export { launch } from './launcher.js';
 export { default_apps } from './default-apps.js';
+export { parse_screen_request } from './screen-intent.js';
+export { capture_all_screens } from './screen-capture.js';
+export {
+	ask_vision_model,
+	create_screen_analyzer,
+	for_speech,
+	DEFAULT_VISION_MODEL,
+	TARS_PERSONA
+} from './screen-vision.js';
 
 export const IPC_CHANNEL = 'computer-control:run';
+export const UTTERANCE_CHANNEL = 'computer-control:utterance';
 
 /**
  * A command as produced by the AI. Only `action` is interpreted strictly (via `canonIntent`);
@@ -25,22 +39,28 @@ export const IPC_CHANNEL = 'computer-control:run';
  * @property {string} [query]
  * @property {string} [url]
  * @property {string} [browser] which browser to open a URL in
+ * @property {string} [question] for analyze_screen: what to answer about the screen
  */
 
 /**
- * @typedef {{ ok: true, action: string, message: string, pid?: number, apps?: Array<{ id: string, name: string }>, links?: Array<{ id: string, name: string }> }
+ * @typedef {{ ok: true, action: string, message: string, pid?: number, question?: string | null, screens?: number, apps?: Array<{ id: string, name: string }>, links?: Array<{ id: string, name: string }> }
  *   | { ok: false, action: string | null, error: string }} RunResult
  */
 
 /**
- * @typedef {LaunchDeps & { user_data_dir: string, warn?: (message: string) => void }} Options
+ * @typedef {LaunchDeps & {
+ *   user_data_dir: string,
+ *   warn?: (message: string) => void,
+ *   screen?: ScreenAnalyzerOptions
+ * }} Options
  */
 
 /**
  * @param {Options} options
  */
 export function create_computer_control(options) {
-	const { user_data_dir, warn = () => {}, ...launch_deps } = options;
+	const { user_data_dir, warn = () => {}, screen, ...launch_deps } = options;
+	const analyzer = screen ? create_screen_analyzer(screen) : null;
 
 	function apps() {
 		const result = load_apps(user_data_dir, launch_deps.platform);
@@ -69,6 +89,22 @@ export function create_computer_control(options) {
 		const match_any = (phrase) => match_app(phrase, [...list, ...links]);
 
 		let action = canonIntent(action_text);
+		if (action === null && parse_screen_request(action_text)) action = ACTIONS.ANALYZE_SCREEN;
+
+		if (action === ACTIONS.ANALYZE_SCREEN) {
+			const explicit = first_string(command.question, command.query, command.target);
+			/** @type {string | null} */
+			let question = null;
+			if (explicit) {
+				// "look at my screen and tell me X" may arrive whole in the question field
+				const parsed = parse_screen_request(explicit);
+				if (parsed) question = parsed.question;
+				else if (canonIntent(explicit) !== ACTIONS.ANALYZE_SCREEN) question = explicit;
+			} else {
+				question = parse_screen_request(action_text)?.question ?? null;
+			}
+			return analyze_screen(question);
+		}
 
 		if (action === null) {
 			if (action_text) {
@@ -193,31 +229,100 @@ export function create_computer_control(options) {
 		}
 	}
 
-	return { run, apps };
+	/**
+	 * @param {string | null} question
+	 * @returns {Promise<RunResult>}
+	 */
+	async function analyze_screen(question) {
+		const action = ACTIONS.ANALYZE_SCREEN;
+		if (!analyzer) {
+			return {
+				ok: false,
+				action,
+				error:
+					'Screen capture is not set up: pass desktopCapturer and screen to register_computer_control.'
+			};
+		}
+		const result = await analyzer.analyze(question);
+		return result.ok
+			? {
+					ok: true,
+					action,
+					message: result.text,
+					question: result.question,
+					screens: result.screens
+				}
+			: { ok: false, action, error: result.error };
+	}
+
+	/**
+	 * Check a raw transcript before it goes to the language model. Screen requests are handled
+	 * right here (and answered by voice); anything else returns `null` so the caller carries on.
+	 *
+	 * @param {string} text
+	 * @returns {Promise<RunResult | null>}
+	 */
+	async function handle_utterance(text) {
+		const parsed = parse_screen_request(text);
+		if (!parsed) return null;
+		return analyze_screen(parsed.question);
+	}
+
+	return { run, apps, handle_utterance };
 }
 
 /**
  * Wire computer control into the Electron main process:
  *
  * ```js
- * import { app, ipcMain } from 'electron';
- * register_computer_control({ app, ipcMain });
- * // renderer (via preload): ipcRenderer.invoke('computer-control:run', { action: 'open app', target: 'browse the web' })
+ * import { app, ipcMain, desktopCapturer, screen, systemPreferences } from 'electron';
+ *
+ * app.whenReady().then(() => {
+ *   register_computer_control({
+ *     app, ipcMain, desktopCapturer, screen, systemPreferences,
+ *     speak: (text) => tts.say(text) // your TARS voice
+ *   });
+ * });
+ * // renderer (via preload):
+ * //   ipcRenderer.invoke('computer-control:run', { action: 'open app', target: 'browse the web' })
+ * //   ipcRenderer.invoke('computer-control:utterance', transcript) // null → not a screen request
  * ```
  *
  * @param {{
  *   app: { getPath(name: 'userData'): string },
- *   ipcMain: { handle(channel: string, listener: (event: unknown, command: Command) => Promise<RunResult>): void },
+ *   ipcMain: { handle(channel: string, listener: (event: unknown, arg: any) => Promise<RunResult | null>): void },
+ *   desktopCapturer?: CaptureDeps['desktopCapturer'],
+ *   screen?: CaptureDeps['screen'],
+ *   systemPreferences?: CaptureDeps['systemPreferences'],
+ *   speak?: (text: string) => unknown,
+ *   vision?: VisionOptions,
  *   warn?: (message: string) => void
  * }} electron
  */
-export function register_computer_control({ app, ipcMain, warn }) {
-	const control = create_computer_control({ user_data_dir: app.getPath('userData'), warn });
+export function register_computer_control({
+	app,
+	ipcMain,
+	desktopCapturer,
+	screen,
+	systemPreferences,
+	speak,
+	vision,
+	warn
+}) {
+	const control = create_computer_control({
+		user_data_dir: app.getPath('userData'),
+		warn,
+		screen:
+			desktopCapturer && screen
+				? { ...vision, speak, capture: { desktopCapturer, screen, systemPreferences } }
+				: undefined
+	});
 
 	// seed apps.json on startup rather than on the first command
 	control.apps();
 
 	ipcMain.handle(IPC_CHANNEL, (_event, command) => control.run(command));
+	ipcMain.handle(UTTERANCE_CHANNEL, (_event, text) => control.handle_utterance(text));
 	return control;
 }
 
